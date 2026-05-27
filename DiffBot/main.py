@@ -1,133 +1,144 @@
 import os
+import json
+import shutil
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 import requests
-from diffusion_api import generate_image 
+from diffusion_api import generate_image
+from upscale_api import upscale_image, AVAILABLE_UPSCALE_MODELS
+from settings import (
+    get_user_settings, save_user_settings, get_settings_text, 
+    handle_settings_callback, main_settings_keyboard
+)
 
 TOKEN = "8696382759:AAG7JkFL1FNfsV1rqUEmJE307MMkidcIMIc"
 bot = telebot.TeleBot(TOKEN)
 
-ALLOWED_USERS = [6738379690, 5233742292]
+ALLOWED_USERS_FILE = "allowed_users.json"
 
-# Хранилище настроек для каждого пользователя
-user_settings = {}
+def load_allowed_users():
+    global ALLOWED_USERS
+    if os.path.exists(ALLOWED_USERS_FILE):
+        with open(ALLOWED_USERS_FILE, 'r') as f:
+            ALLOWED_USERS = json.load(f)
+    else:
+        ALLOWED_USERS = [6738379690, 5233742292]
+        save_allowed_users()
 
-def get_user_settings(user_id):
-    """Получить настройки пользователя или создать стандартные"""
-    if user_id not in user_settings:
-        user_settings[user_id] = {
-            'width': 512,
-            'height': 512,
-            'steps': 20,
-            'guidance_scale': 7.5  # это и есть denoising (CFG scale)
-        }
-    return user_settings[user_id]
+def save_allowed_users():
+    with open(ALLOWED_USERS_FILE, 'w') as f:
+        json.dump(ALLOWED_USERS, f, indent=2)
 
-def settings_keyboard(user_id):
-    """Создать клавиатуру с текущими настройками"""
-    settings = get_user_settings(user_id)
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    
-    # Кнопки размера
-    keyboard.add(
-        InlineKeyboardButton(f"📐 Размер: {settings['width']}×{settings['height']}", callback_data="size_menu")
-    )
-    
-    # Кнопки шагов и денойзинга
-    keyboard.add(
-        InlineKeyboardButton(f"🔢 Шаги: {settings['steps']}", callback_data="steps_menu"),
-        InlineKeyboardButton(f"🎨 Denoising: {settings['guidance_scale']}", callback_data="cfg_menu")
-    )
-    
-    # Кнопка сброса
-    keyboard.add(
-        InlineKeyboardButton("🔄 Сбросить настройки", callback_data="reset_settings")
-    )
-    
-    # Кнопка генерации
-    keyboard.add(
-        InlineKeyboardButton("✨ Готово, генерируй!", callback_data="generate_from_settings")
-    )
-    
-    return keyboard
+def is_admin(user_id):
+    return ALLOWED_USERS and ALLOWED_USERS[0] == user_id
 
-def size_keyboard():
-    """Клавиатура выбора размера"""
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    sizes = [
-        ("512×512", 512, 512),
-        ("768×512", 768, 512),
-        ("512×768", 512, 768),
-        ("768×768", 768, 768),
-        ("1024×1024", 1024, 1024)
-    ]
-    
-    for label, w, h in sizes:
-        keyboard.add(InlineKeyboardButton(label, callback_data=f"size_{w}_{h}"))
-    
-    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_settings"))
-    return keyboard
+load_allowed_users()
 
-def steps_keyboard(current_steps):
-    """Клавиатура выбора количества шагов"""
-    keyboard = InlineKeyboardMarkup(row_width=3)
-    steps_options = [15, 20, 25, 30, 35, 40]
-    
-    buttons = []
-    for steps in steps_options:
-        marker = "✅ " if steps == current_steps else ""
-        buttons.append(InlineKeyboardButton(f"{marker}{steps}", callback_data=f"steps_{steps}"))
-    
-    keyboard.add(*buttons)
-    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_settings"))
-    return keyboard
+# Папка для хранения сгенерированных картинок (не удаляем сразу)
+PHOTO_STORAGE = "generated_photos"
+os.makedirs(PHOTO_STORAGE, exist_ok=True)
 
-def cfg_keyboard(current_cfg):
-    """Клавиатура выбора denoising (CFG scale)"""
-    keyboard = InlineKeyboardMarkup(row_width=3)
-    cfg_options = [5.0, 6.0, 7.0, 7.5, 8.0, 9.0, 10.0, 12.0]
-    
-    buttons = []
-    for cfg in cfg_options:
-        marker = "✅ " if cfg == current_cfg else ""
-        buttons.append(InlineKeyboardButton(f"{marker}{cfg}", callback_data=f"cfg_{cfg}"))
-    
-    keyboard.add(*buttons)
-    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_settings"))
-    return keyboard
+# Хранилища
+last_photo = {}  # user_id -> путь к последней картинке
+user_state = {}  # временные состояния
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.reply_to(message, 
-        "🎨 Привет! Я бот для генерации изображений через EasyDiffusion!\n\n"
-        "📝 Как использовать:\n"
-        "1. Нажми /settings чтобы настроить параметры\n"
-        "2. Или просто отправь мне текстовый промпт на английском\n\n"
-        "⚙️ Можно менять:\n"
-        "• Размер картинки\n"
-        "• Количество шагов (качество генерации)\n"
-        "• Denoising (насколько сильно меняется картинка)"
-    )
+        "🎨 *Бот для генерации изображений Stable Diffusion*\n\n"
+        "📝 *Как использовать:*\n"
+        "1. Нажми /settings — настрой параметры\n"
+        "2. Или просто отправь промпт\n\n"
+        "⚙️ *Команды:*\n"
+        "/settings — настройки\n"
+        "/access — управление доступом (админ)\n"
+        "/upscale — увеличить последнюю картинку\n"
+        "/last — показать последнюю картинку",
+        parse_mode='Markdown')
 
 @bot.message_handler(commands=['settings'])
 def show_settings(message):
-    """Показать текущие настройки"""
+    if message.from_user.id not in ALLOWED_USERS:
+        bot.reply_to(message, "🔒 Доступ закрыт.")
+        return
+    
+    text = get_settings_text(message.from_user.id) + "\n👇 Выбери, что изменить:"
+    bot.send_message(message.chat.id, text, 
+                     reply_markup=main_settings_keyboard(message.from_user.id),
+                     parse_mode='Markdown')
+
+@bot.message_handler(commands=['access'])
+def manage_access(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "🔒 Только администратор.")
+        return
+    
+    keyboard = ReplyKeyboardMarkup(row_width=1, resize_keyboard=True, one_time_keyboard=True)
+    keyboard.add(KeyboardButton("📱 Отправить контакт", request_contact=True))
+    
+    bot.reply_to(message, "👥 *Управление доступом*\n\nНажми кнопку или отправь ID числом:", 
+                 reply_markup=keyboard, parse_mode='Markdown')
+    
+    inline_keyboard = InlineKeyboardMarkup(row_width=2)
+    inline_keyboard.add(
+        InlineKeyboardButton("📋 Список", callback_data="access_list"),
+        InlineKeyboardButton("❌ Удалить", callback_data="access_remove_menu")
+    )
+    bot.send_message(message.chat.id, "Действия:", reply_markup=inline_keyboard)
+
+@bot.message_handler(commands=['upscale'])
+def handle_upscale_command(message):
     user_id = message.from_user.id
     if user_id not in ALLOWED_USERS:
         bot.reply_to(message, "🔒 Доступ закрыт.")
         return
     
-    settings = get_user_settings(user_id)
-    text = (f"⚙️ *Текущие настройки:*\n\n"
-            f"📐 Размер: `{settings['width']}×{settings['height']}`\n"
-            f"🔢 Шаги: `{settings['steps']}`\n"
-            f"🎨 Denoising (CFG): `{settings['guidance_scale']}`\n\n"
-            f"👇 Нажми на кнопку, чтобы изменить параметр:")
+    if user_id not in last_photo or not os.path.exists(last_photo[user_id]):
+        bot.reply_to(message, "❌ Нет картинки для увеличения. Сначала сгенерируй изображение или используй /last чтобы показать последнюю.")
+        return
     
-    bot.send_message(message.chat.id, text, 
-                     reply_markup=settings_keyboard(user_id),
-                     parse_mode='Markdown')
+    # Сохраняем пользователя в состоянии
+    user_state[user_id] = {'step': 'select_scale'}
+    
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("🔼 2x", callback_data="upscale_scale_2"),
+        InlineKeyboardButton("🔼 4x", callback_data="upscale_scale_4")
+    )
+    keyboard.add(InlineKeyboardButton("🔙 Отмена", callback_data="upscale_cancel"))
+    
+    bot.reply_to(message, "🔍 *Upscale*\n\nВыбери коэффициент увеличения:", 
+                 reply_markup=keyboard, parse_mode='Markdown')
+
+@bot.message_handler(commands=['last'])
+def show_last_photo(message):
+    """Показать последнюю сгенерированную картинку"""
+    user_id = message.from_user.id
+    if user_id not in ALLOWED_USERS:
+        bot.reply_to(message, "🔒 Доступ закрыт.")
+        return
+    
+    if user_id not in last_photo or not os.path.exists(last_photo[user_id]):
+        bot.reply_to(message, "❌ Нет сохранённой картинки. Сначала сгенерируй изображение.")
+        return
+    
+    with open(last_photo[user_id], 'rb') as photo:
+        bot.send_photo(message.chat.id, photo, caption="🖼 Твоя последняя картинка\n\n🔼 /upscale — увеличить")
+
+@bot.message_handler(content_types=['contact'])
+def handle_contact(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    contact_user_id = message.contact.user_id
+    name = f"{message.contact.first_name or ''} {message.contact.last_name or ''}".strip()
+    
+    if contact_user_id not in ALLOWED_USERS:
+        ALLOWED_USERS.append(contact_user_id)
+        save_allowed_users()
+        bot.reply_to(message, f"✅ {name} (ID: `{contact_user_id}`) добавлен.", parse_mode='Markdown')
+    else:
+        bot.reply_to(message, f"⚠️ {name} уже в списке.")
 
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
@@ -136,145 +147,295 @@ def handle_callback(call):
         bot.answer_callback_query(call.id, "Доступ закрыт")
         return
     
-    if call.data == "size_menu":
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=size_keyboard())
+    data = call.data
     
-    elif call.data == "steps_menu":
-        current_steps = get_user_settings(user_id)['steps']
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=steps_keyboard(current_steps))
+    # ===== УПРАВЛЕНИЕ ДОСТУПОМ =====
+    if data == "access_list":
+        users_list = "\n".join([f"• `{uid}`" + (" 👑 админ" if i == 0 else "") for i, uid in enumerate(ALLOWED_USERS)])
+        bot.send_message(call.message.chat.id, f"📋 *Список:*\n\n{users_list}", parse_mode='Markdown')
+        bot.answer_callback_query(call.id)
+        return
     
-    elif call.data == "cfg_menu":
-        current_cfg = get_user_settings(user_id)['guidance_scale']
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=cfg_keyboard(current_cfg))
-    
-    elif call.data.startswith("size_"):
-        _, w, h = call.data.split("_")
-        settings = get_user_settings(user_id)
-        settings['width'] = int(w)
-        settings['height'] = int(h)
-        bot.answer_callback_query(call.id, f"✅ Размер изменён на {w}×{h}")
+    elif data == "access_remove_menu":
+        if len(ALLOWED_USERS) <= 1:
+            bot.answer_callback_query(call.id, "❌ Нельзя удалить админа")
+            return
         
-        # Обновляем клавиатуру
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=settings_keyboard(user_id))
-    
-    elif call.data.startswith("steps_"):
-        steps = int(call.data.split("_")[1])
-        settings = get_user_settings(user_id)
-        settings['steps'] = steps
-        bot.answer_callback_query(call.id, f"✅ Шагов: {steps}")
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        for uid in ALLOWED_USERS[1:]:
+            try:
+                user = bot.get_chat(uid)
+                name = f"{user.first_name or ''} {user.last_name or ''}".strip() or str(uid)
+            except:
+                name = str(uid)
+            keyboard.add(InlineKeyboardButton(f"❌ {name[:30]}", callback_data=f"remove_{uid}"))
+        keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_access"))
         
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=settings_keyboard(user_id))
+        bot.edit_message_text("👥 *Выбери пользователя:*", call.message.chat.id, 
+                            call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
+        bot.answer_callback_query(call.id)
+        return
     
-    elif call.data.startswith("cfg_"):
-        cfg = float(call.data.split("_")[1])
-        settings = get_user_settings(user_id)
-        settings['guidance_scale'] = cfg
-        bot.answer_callback_query(call.id, f"✅ Denoising: {cfg}")
+    elif data.startswith("remove_"):
+        uid_to_remove = int(data.split("_")[1])
+        if uid_to_remove in ALLOWED_USERS:
+            ALLOWED_USERS.remove(uid_to_remove)
+            save_allowed_users()
+            bot.answer_callback_query(call.id, "✅ Удалён")
+            bot.edit_message_text("✅ Пользователь удалён.", call.message.chat.id, call.message.message_id)
+        return
+    
+    elif data == "back_to_access":
+        inline_keyboard = InlineKeyboardMarkup(row_width=2)
+        inline_keyboard.add(
+            InlineKeyboardButton("📋 Список", callback_data="access_list"),
+            InlineKeyboardButton("❌ Удалить", callback_data="access_remove_menu")
+        )
+        bot.edit_message_text("👥 *Управление доступом*", call.message.chat.id,
+                            call.message.message_id, reply_markup=inline_keyboard, parse_mode='Markdown')
+        return
+    
+    # ===== UPSCALE =====
+    elif data == "upscale_cancel":
+        if user_id in user_state:
+            del user_state[user_id]
+        bot.edit_message_text("❌ Upscale отменён.", call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id)
+        return
+    
+    elif data == "upscale_scale_2":
+        if user_id not in user_state:
+            user_state[user_id] = {}
+        user_state[user_id]['scale'] = 2
+        user_state[user_id]['step'] = 'select_model'
+        show_model_menu(call.message, user_id)
+        bot.answer_callback_query(call.id)
+        return
+    
+    elif data == "upscale_scale_4":
+        if user_id not in user_state:
+            user_state[user_id] = {}
+        user_state[user_id]['scale'] = 4
+        user_state[user_id]['step'] = 'select_model'
+        show_model_menu(call.message, user_id)
+        bot.answer_callback_query(call.id)
+        return
+    
+    elif data.startswith("upscale_model_"):
+        model = data.replace("upscale_model_", "")
+        user_state[user_id]['model'] = model
+        user_state[user_id]['step'] = 'select_face'
+        show_face_menu(call.message, user_id)
+        bot.answer_callback_query(call.id)
+        return
+    
+    elif data == "upscale_face_on":
+        user_state[user_id]['face'] = True
+        start_upscale(call.message, user_id)
+        bot.answer_callback_query(call.id)
+        return
+    
+    elif data == "upscale_face_off":
+        user_state[user_id]['face'] = False
+        start_upscale(call.message, user_id)
+        bot.answer_callback_query(call.id)
+        return
+    
+    # ===== НАСТРОЙКИ (вызываем из settings.py) =====
+    result = handle_settings_callback(call, bot, user_id, data)
+    
+    if result == "need_custom_size":
+        bot.register_next_step_handler_by_chat_id(call.message.chat.id, handle_custom_size)
+    elif result == "need_custom_seed":
+        bot.register_next_step_handler_by_chat_id(call.message.chat.id, handle_custom_seed)
+
+def show_model_menu(message, user_id):
+    """Показать меню выбора модели апскейла"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    
+    for model_id, model_name in AVAILABLE_UPSCALE_MODELS.items():
+        keyboard.add(InlineKeyboardButton(f"📷 {model_name}", callback_data=f"upscale_model_{model_id}"))
+    
+    keyboard.add(InlineKeyboardButton("🔙 Отмена", callback_data="upscale_cancel"))
+    
+    bot.edit_message_text(
+        f"🔍 *Upscale {user_state[user_id]['scale']}x*\n\n"
+        f"📷 Выбери модель апскейла:",
+        message.chat.id,
+        message.message_id,
+        reply_markup=keyboard,
+        parse_mode='Markdown'
+    )
+
+def show_face_menu(message, user_id):
+    """Показать меню выбора восстановления лиц"""
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("✅ Включить (GFPGAN)", callback_data="upscale_face_on"),
+        InlineKeyboardButton("❌ Выключить", callback_data="upscale_face_off")
+    )
+    keyboard.add(InlineKeyboardButton("🔙 Отмена", callback_data="upscale_cancel"))
+    
+    bot.edit_message_text(
+        f"🔍 *Upscale {user_state[user_id]['scale']}x*\n"
+        f"📷 Модель: {AVAILABLE_UPSCALE_MODELS.get(user_state[user_id]['model'], user_state[user_id]['model'])}\n\n"
+        f"🎭 Восстанавливать лица?",
+        message.chat.id,
+        message.message_id,
+        reply_markup=keyboard,
+        parse_mode='Markdown'
+    )
+
+def start_upscale(message, user_id):
+    """Запустить процесс upscale"""
+    scale = user_state[user_id]['scale']
+    model = user_state[user_id].get('model', 'realesrgan_4x')
+    face = user_state[user_id].get('face', True)
+    
+    source_path = last_photo[user_id]
+    
+    if not os.path.exists(source_path):
+        bot.edit_message_text("❌ Файл картинки не найден. Сначала сгенерируй новое изображение.",
+                            message.chat.id, message.message_id)
+        return
+    
+    filename = f"upscaled_{user_id}_{scale}x_{model}.jpg"
+    
+    status_msg = bot.edit_message_text(
+        f"🔼 *Upscale {scale}x*\n"
+        f"📷 Модель: {AVAILABLE_UPSCALE_MODELS.get(model, model)}\n"
+        f"🎭 Лица: {'восстановлены' if face else 'без изменений'}\n\n"
+        f"⏳ Обработка... (может занять до минуты)",
+        message.chat.id,
+        message.message_id,
+        parse_mode='Markdown'
+    )
+    
+    try:
+        result_path = upscale_image(
+            input_path=source_path,
+            output_filename=filename,
+            scale=scale,
+            face_restoration=face,
+            upscale_model=model
+        )
         
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=settings_keyboard(user_id))
-    
-    elif call.data == "reset_settings":
-        user_settings[user_id] = {
-            'width': 512,
-            'height': 512,
-            'steps': 20,
-            'guidance_scale': 7.5
-        }
-        bot.answer_callback_query(call.id, "✅ Настройки сброшены!")
+        with open(result_path, 'rb') as photo:
+            bot.send_photo(message.chat.id, photo, 
+                          caption=f"✨ *Готово!*\n🔼 {scale}x\n📷 {AVAILABLE_UPSCALE_MODELS.get(model, model)}\n🎭 Лица: {'восстановлены' if face else 'без изменений'}",
+                          parse_mode='Markdown')
         
-        bot.edit_message_text("⚙️ *Настройки сброшены к стандартным:*\n\n"
-                             "📐 Размер: `512×512`\n"
-                             "🔢 Шаги: `20`\n"
-                             "🎨 Denoising: `7.5`\n\n"
-                             "👇 Настройте параметры:",
-                             call.message.chat.id,
-                             call.message.message_id,
-                             reply_markup=settings_keyboard(user_id),
-                             parse_mode='Markdown')
+        # Удаляем временный файл upscale
+        if os.path.exists(result_path):
+            os.remove(result_path)
+        
+        # Не удаляем статусное сообщение, а заменяем его
+        bot.edit_message_text(f"✅ Upscale завершён!\n🔼 {scale}x\n📷 {AVAILABLE_UPSCALE_MODELS.get(model, model)}",
+                            message.chat.id, status_msg.message_id)
+        
+        # Очищаем состояние пользователя
+        if user_id in user_state:
+            del user_state[user_id]
+        
+    except Exception as e:
+        bot.edit_message_text(f"💥 Ошибка upscale: {str(e)}", 
+                            message.chat.id, status_msg.message_id)
+
+def handle_custom_size(message):
+    if message.from_user.id not in ALLOWED_USERS:
+        return
     
-    elif call.data == "back_to_settings":
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=settings_keyboard(user_id))
+    try:
+        w, h = map(int, message.text.strip().split())
+        w, h = max(256, min(1536, w)), max(256, min(1536, h))
+        settings = get_user_settings(message.from_user.id)
+        settings['width'], settings['height'] = w, h
+        save_user_settings(message.from_user.id, settings)
+        bot.reply_to(message, f"✅ Размер: {w}×{h}")
+    except:
+        bot.reply_to(message, "❌ Формат: `1024 768`", parse_mode='Markdown')
+    show_settings(message)
+
+def handle_custom_seed(message):
+    if message.from_user.id not in ALLOWED_USERS:
+        return
     
-    elif call.data == "generate_from_settings":
-        bot.answer_callback_query(call.id, "🎨 Начинаю генерацию...")
-        # Вызываем генерацию с текущим промптом
-        # Для этого нужно сохранить последний промпт пользователя
-        # Пока просто закроем меню и скажем отправить промпт
-        bot.edit_message_text("📝 Отправьте текстовый промпт на английском языке, "
-                             "и я сгенерирую картинку с вашими настройками.",
-                             call.message.chat.id,
-                             call.message.message_id)
-        bot.clear_step_handler_by_chat_id(call.message.chat.id)
+    try:
+        seed = int(message.text.strip())
+        settings = get_user_settings(message.from_user.id)
+        settings['seed'] = seed
+        save_user_settings(message.from_user.id, settings)
+        bot.reply_to(message, f"✅ Seed: {seed}")
+    except:
+        bot.reply_to(message, "❌ Отправь целое число")
+    show_settings(message)
+
+def add_user_by_id(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        new_id = int(message.text.strip())
+        if new_id not in ALLOWED_USERS:
+            ALLOWED_USERS.append(new_id)
+            save_allowed_users()
+            bot.reply_to(message, f"✅ ID `{new_id}` добавлен.", parse_mode='Markdown')
+    except:
+        pass
 
 @bot.message_handler(func=lambda message: True)
 def handle_generation(message):
     if message.from_user.id not in ALLOWED_USERS:
-        bot.reply_to(message, "🔒 Доступ закрыт. Этот бот приватный.")
+        bot.reply_to(message, "🔒 Доступ закрыт.")
         return
-        
+    
+    if is_admin(message.from_user.id) and message.text.strip().isdigit() and len(message.text.strip()) > 5:
+        add_user_by_id(message)
+        return
+    
     prompt = message.text
     if prompt.startswith('/'):
         return
     
-    # Получаем настройки пользователя
     settings = get_user_settings(message.from_user.id)
     
-    # Показываем статус
     status_msg = bot.reply_to(message, 
-        f"⏳ Генерация началась...\n"
-        f"📐 {settings['width']}×{settings['height']} | "
-        f"🔢 {settings['steps']} шагов | "
-        f"🎨 CFG: {settings['guidance_scale']}\n"
-        f"🎨 Промпт: {prompt[:50]}..."
-    )
+        f"⏳ *Генерация...*\n📐 {settings['width']}×{settings['height']}\n🔢 {settings['steps']} steps\n"
+        f"🎨 CFG: {settings['guidance_scale']}\n🎲 Seed: {settings['seed'] if settings['seed'] != -1 else 'random'}",
+        parse_mode='Markdown')
     
-    filename = f"output_{message.from_user.id}.jpg"
-
+    # Сохраняем файл в папку, а не в корень
+    filename = os.path.join(PHOTO_STORAGE, f"output_{message.from_user.id}.jpg")
+    
     try:
-        # Передаём настройки в функцию генерации
         image_path = generate_image(
-            prompt=prompt,
-            output_filename=filename,
-            width=settings['width'],
-            height=settings['height'],
-            steps=settings['steps'],
-            guidance_scale=settings['guidance_scale']
+            prompt=prompt, output_filename=filename,
+            width=settings['width'], height=settings['height'],
+            steps=settings['steps'], guidance_scale=settings['guidance_scale'],
+            seed=settings['seed'] if settings['seed'] != -1 else None
         )
         
-        # Отправляем результат
+        # Сохраняем путь к картинке (НЕ УДАЛЯЕМ!)
+        last_photo[message.from_user.id] = image_path
+        
         with open(image_path, 'rb') as photo:
-            caption = (f"✨ *Готово!*\n\n"
-                      f"📝 Промпт: `{prompt}`\n"
-                      f"📐 {settings['width']}×{settings['height']}\n"
-                      f"🔢 {settings['steps']} шагов\n"
-                      f"🎨 CFG: {settings['guidance_scale']}")
-            
             bot.send_photo(message.chat.id, photo, 
-                          caption=caption,
+                          caption=f"✨ *Готово!*\n\n`{prompt[:100]}`\n\n🔼 /upscale — увеличить\n🖼 /last — показать последнюю",
                           parse_mode='Markdown')
-            
-        # Удаляем временный файл
-        if os.path.exists(image_path):
-            os.remove(image_path)
-            
-        # Удаляем статусное сообщение
-        bot.delete_message(message.chat.id, status_msg.message_id)
-
-    except requests.exceptions.ConnectionError:
-        bot.edit_message_text("❌ Не удалось подключиться к EasyDiffusion. Проверьте, запущен ли сервер на ПК.", 
+        
+        # НЕ УДАЛЯЕМ файл! Он нужен для upscale
+        # bot.delete_message(message.chat.id, status_msg.message_id) - тоже не удаляем
+        
+        bot.edit_message_text(f"✅ Генерация завершена!", 
                             message.chat.id, status_msg.message_id)
+        
     except Exception as e:
-        bot.edit_message_text(f"💥 Ошибка: {str(e)}", 
-                            message.chat.id, status_msg.message_id)
+        bot.edit_message_text(f"💥 Ошибка: {str(e)}", message.chat.id, status_msg.message_id)
         if os.path.exists(filename):
             os.remove(filename)
 
-print("🤖 Бот-генератор с настройками запущен...")
+print("🤖 Бот запущен!")
+print(f"👥 Разрешённые пользователи: {ALLOWED_USERS}")
+print(f"👑 Администратор: {ALLOWED_USERS[0] if ALLOWED_USERS else 'не задан'}")
+print(f"📁 Картинки сохраняются в: {PHOTO_STORAGE}")
 bot.infinity_polling()

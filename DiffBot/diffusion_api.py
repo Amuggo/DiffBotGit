@@ -9,37 +9,43 @@ RENDER_URL = f"{BASE_URL}/render"
 
 def generate_image(prompt: str, output_filename: str = "output.jpg", 
                    width: int = 512, height: int = 512, 
-                   steps: int = 20, guidance_scale: float = 7.5) -> str:
+                   steps: int = 20, guidance_scale: float = 7.5,
+                   seed: int = None) -> str:
+    
+    # Отладка
+    print(f"🔍 [generate_image] Параметры:")
+    print(f"   width={width}, height={height}, steps={steps}, cfg={guidance_scale}, seed={seed}")
+    
+    # Если seed не указан — генерируем случайный
+    if seed is None or seed == -1:
+        seed = random.randint(1, 2**32 - 1)
     
     payload = {
         "prompt": prompt,
         "negative_prompt": "ugly, deformed, blurry, low quality, bad anatomy",
         "width": width,
         "height": height,
-        "steps": steps,
+        "num_inference_steps": steps,
         "num_outputs": 1,
-        "seed": random.randint(100000000, 999999999),
+        "seed": seed,
         "sampler_name": "euler_a",
         "guidance_scale": guidance_scale,
         "use_stable_diffusion_model": "epicrealism_naturalSinRC1VAE", 
         "stream_progress_updates": False
     }
-
-    print(f"🎨 Параметры генерации: {width}×{height}, {steps} steps, CFG={guidance_scale}")
     
-    # Отправляем задачу
+    print(f"🎨 Отправляю в EasyDiffusion: {width}×{height}, {steps} steps, CFG={guidance_scale}, seed={seed}")
+    
     response = requests.post(RENDER_URL, json=payload, timeout=15)
     
     if response.status_code != 200:
-        raise Exception(f"EasyDiffusion отклонил запрос. Статус: {response.status_code}")
+        raise Exception(f"EasyDiffusion отклонил запрос. Статус: {response.status_code}, Ответ: {response.text[:200]}")
         
     init_data = response.json()
     stream_endpoint = init_data.get("stream")
     
     if not stream_endpoint:
         raise Exception(f"Не удалось получить ID потока. Ответ: {init_data}")
-        
-    print(f"⏳ Задача зарегистрирована, идёт генерация...")
     
     stream_url = f"{BASE_URL}{stream_endpoint}"
     time.sleep(5)
@@ -81,11 +87,15 @@ def generate_image(prompt: str, output_filename: str = "output.jpg",
         
     if isinstance(output_list, list) and len(output_list) > 0:
         img_data = output_list[0].get("data")
+        actual_seed = output_list[0].get("seed", seed)
     else:
         img_data = output_list.get("data")
+        actual_seed = output_list.get("seed", seed)
         
     if not img_data:
         raise Exception("Не найден ключ 'data' с картинкой")
+        
+    print(f"🎲 Фактический seed: {actual_seed}")
         
     if "," in img_data:
         img_data = img_data.split(",")[1]
