@@ -1,10 +1,8 @@
 {
   "6738379690": {
     "width": 768,
-    "height": 768,
+    "height": 512,
     "steps": 25,
-    "guidance_scale": 7.0,
-    "seed": -1,
-    "model": "epicrealism_naturalSinRC1VAE"
+    "guidance_scale": 7.5
   }
 }
