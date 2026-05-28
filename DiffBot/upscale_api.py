@@ -1,12 +1,10 @@
 import os
-import time
 import base64
 import requests
 
 BASE_URL = "http://localhost:9000"
 UPSCALE_URL = f"{BASE_URL}/upscale"
 
-# Доступные модели upscale (замените на те, что установлены у вас)
 AVAILABLE_UPSCALE_MODELS = {
     "realesrgan_4x": "RealESRGAN 4x",
     "realesrgan_2x": "RealESRGAN 2x",
@@ -16,44 +14,42 @@ AVAILABLE_UPSCALE_MODELS = {
 }
 
 def upscale_image(input_path: str, output_filename: str = "upscaled.jpg", 
-                  scale: int = 2, face_restoration: bool = True,
-                  upscale_model: str = "realesrgan_4x") -> str:
-    """
-    Увеличить изображение через EasyDiffusion
+                  scale: int = 2, 
+                  use_upscale: str = "realesrgan_4x",
+                  codeformer_upscale_faces: bool = True,
+                  codeformer_fidelity: float = 0.5) -> str:
     
-    Args:
-        input_path: путь к исходному изображению
-        output_filename: имя для сохранения результата
-        scale: коэффициент увеличения (2, 4)
-        face_restoration: восстанавливать лица (GFPGAN)
-        upscale_model: модель апскейла (из AVAILABLE_UPSCALE_MODELS)
-    
-    Returns:
-        путь к сохранённому изображению
-    """
-    
-    # Читаем исходное изображение и кодируем в base64
     with open(input_path, "rb") as f:
         image_base64 = base64.b64encode(f.read()).decode('utf-8')
     
+    # Собираем payload, исключая параметры, которые могут вызвать ошибку
     payload = {
         "image": image_base64,
-        "scale": scale,
-        "face_restoration": face_restoration,
-        "upscale_model": upscale_model,
         "num_outputs": 1
     }
     
-    print(f"🔼 Upscale: коэффициент {scale}x, модель: {upscale_model}, восстановление лиц: {face_restoration}")
+    # Добавляем только те параметры, которые точно нужны и в правильном формате
+    payload["upscale_amount"] = scale
+    
+    if use_upscale:
+        payload["use_upscale"] = use_upscale
+    
+    # codeformer_upscale_faces ожидает строку "yes" или "no"
+    payload["codeformer_upscale_faces"] = "yes" if codeformer_upscale_faces else "no"
+    payload["codeformer_fidelity"] = codeformer_fidelity
+    
+    print(f"🔼 Upscale: коэффициент {scale}x")
+    print(f"   use_upscale: {use_upscale}")
+    print(f"   codeformer_upscale_faces: {payload['codeformer_upscale_faces']}")
+    print(f"   codeformer_fidelity: {codeformer_fidelity}")
     
     response = requests.post(UPSCALE_URL, json=payload, timeout=60)
     
     if response.status_code != 200:
-        raise Exception(f"Upscale не удался. Статус: {response.status_code}, Ответ: {response.text[:200]}")
+        raise Exception(f"Upscale не удался. Статус: {response.status_code}, Ответ: {response.text[:500]}")
     
     result_data = response.json()
     
-    # Извлекаем картинку из ответа
     output_list = result_data.get("output", [])
     if not output_list:
         raise Exception("Поле 'output' пустое")

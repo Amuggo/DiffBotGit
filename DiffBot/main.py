@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import shutil
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -10,7 +11,8 @@ from settings import (
     get_user_settings, save_user_settings, get_settings_text, 
     handle_settings_callback, main_settings_keyboard
 )
-
+PHOTO_STORAGE = "generated_photos"
+os.makedirs(PHOTO_STORAGE, exist_ok=True)
 TOKEN = "8696382759:AAG7JkFL1FNfsV1rqUEmJE307MMkidcIMIc"
 bot = telebot.TeleBot(TOKEN)
 
@@ -305,19 +307,23 @@ def start_upscale(message, user_id):
         f"🔼 *Upscale {scale}x*\n"
         f"📷 Модель: {AVAILABLE_UPSCALE_MODELS.get(model, model)}\n"
         f"🎭 Лица: {'восстановлены' if face else 'без изменений'}\n\n"
-        f"⏳ Обработка... (может занять до минуты)",
+        f"⏳ Обработка...",
         message.chat.id,
         message.message_id,
         parse_mode='Markdown'
     )
     
     try:
+        # Преобразуем boolean в "yes"/"no" для API
+        face_str = "yes" if face else "no"
+        
         result_path = upscale_image(
             input_path=source_path,
             output_filename=filename,
             scale=scale,
-            face_restoration=face,
-            upscale_model=model
+            use_upscale=model,
+            codeformer_upscale_faces=face_str,  # ← теперь строка
+            codeformer_fidelity=0.5
         )
         
         with open(result_path, 'rb') as photo:
@@ -325,15 +331,11 @@ def start_upscale(message, user_id):
                           caption=f"✨ *Готово!*\n🔼 {scale}x\n📷 {AVAILABLE_UPSCALE_MODELS.get(model, model)}\n🎭 Лица: {'восстановлены' if face else 'без изменений'}",
                           parse_mode='Markdown')
         
-        # Удаляем временный файл upscale
         if os.path.exists(result_path):
             os.remove(result_path)
         
-        # Не удаляем статусное сообщение, а заменяем его
-        bot.edit_message_text(f"✅ Upscale завершён!\n🔼 {scale}x\n📷 {AVAILABLE_UPSCALE_MODELS.get(model, model)}",
-                            message.chat.id, status_msg.message_id)
+        bot.edit_message_text(f"✅ Upscale завершён!", message.chat.id, status_msg.message_id)
         
-        # Очищаем состояние пользователя
         if user_id in user_state:
             del user_state[user_id]
         
@@ -384,6 +386,7 @@ def add_user_by_id(message):
         pass
 
 @bot.message_handler(func=lambda message: True)
+@bot.message_handler(func=lambda message: True)
 def handle_generation(message):
     if message.from_user.id not in ALLOWED_USERS:
         bot.reply_to(message, "🔒 Доступ закрыт.")
@@ -399,40 +402,190 @@ def handle_generation(message):
     
     settings = get_user_settings(message.from_user.id)
     
+    # Примерное время
+    estimated_total = int(settings['steps'] * 1.8) + 10
+    
     status_msg = bot.reply_to(message, 
-        f"⏳ *Генерация...*\n📐 {settings['width']}×{settings['height']}\n🔢 {settings['steps']} steps\n"
-        f"🎨 CFG: {settings['guidance_scale']}\n🎲 Seed: {settings['seed'] if settings['seed'] != -1 else 'random'}",
+        f"⏳ *Генерация началась...*\n\n"
+        f"📐 {settings['width']}×{settings['height']}\n"
+        f"🔢 {settings['steps']} steps\n"
+        f"🎨 CFG: {settings['guidance_scale']}\n\n"
+        f"⏱ Ориентировочное время: ~{estimated_total} секунд",
         parse_mode='Markdown')
     
-    # Сохраняем файл в папку, а не в корень
-    filename = os.path.join(PHOTO_STORAGE, f"output_{message.from_user.id}.jpg")
+    filename = f"output_{message.from_user.id}_{int(time.time())}.jpg"
+    
+    last_update_time = time.time()
+    
+    def update_progress(elapsed, total_estimated):
+        nonlocal last_update_time
+        current_time = time.time()
+        if current_time - last_update_time >= 5:
+            last_update_time = current_time
+            remaining = max(0, total_estimated - elapsed)
+            try:
+                bot.edit_message_text(
+                    f"⏳ *Генерация...* (прошло {elapsed}с, осталось ~{remaining}с)\n\n"
+                    f"📐 {settings['width']}×{settings['height']}\n"
+                    f"🔢 {settings['steps']} steps",
+                    message.chat.id,
+                    status_msg.message_id,
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
     
     try:
         image_path = generate_image(
-            prompt=prompt, output_filename=filename,
-            width=settings['width'], height=settings['height'],
-            steps=settings['steps'], guidance_scale=settings['guidance_scale'],
-            seed=settings['seed'] if settings['seed'] != -1 else None
+            prompt=prompt, 
+            output_filename=filename,
+            width=settings['width'], 
+            height=settings['height'],
+            steps=settings['steps'], 
+            guidance_scale=settings['guidance_scale'],
+            seed=settings['seed'] if settings['seed'] != -1 else None,
+            use_face_correction=False,
+            progress_callback=update_progress
         )
         
-        # Сохраняем путь к картинке (НЕ УДАЛЯЕМ!)
+        # Сохраняем путь к картинке (НЕ УДАЛЯЕМ)
+        last_photo[message.from_user.id] = image_path
+        
+        # Отправляем фото
+        with open(image_path, 'rb') as photo:
+            bot.send_photo(
+                message.chat.id, 
+                photo, 
+                caption=f"✨ *Готово!*\n\n"
+                       f"📝 `{prompt[:100]}`\n\n"
+                       f"🔼 /upscale — увеличить\n"
+                       f"🖼 /last — показать последнюю",
+                parse_mode='Markdown'
+            )
+        
+        # Удаляем только статусное сообщение, фото НЕ УДАЛЯЕМ
+        bot.delete_message(message.chat.id, status_msg.message_id)
+        
+    except Exception as e:
+        error_text = str(e)
+        print(f"❌ Ошибка генерации: {error_text}")
+        bot.edit_message_text(f"💥 *Ошибка генерации*\n`{error_text[:200]}`", 
+                            message.chat.id, 
+                            status_msg.message_id,
+                            parse_mode='Markdown')
+    
+    filename = os.path.join(PHOTO_STORAGE, f"output_{message.from_user.id}.jpg")
+    
+    last_update_time = time.time()
+    
+    def update_progress(elapsed, total_estimated):
+        nonlocal last_update_time
+        current_time = time.time()
+        # Обновляем раз в 5 секунд
+        if current_time - last_update_time >= 5:
+            last_update_time = current_time
+            remaining = max(0, total_estimated - elapsed)
+            try:
+                bot.edit_message_text(
+                    f"⏳ *Генерация...* (прошло {elapsed}с, осталось ~{remaining}с)\n\n"
+                    f"📐 {settings['width']}×{settings['height']}\n"
+                    f"🔢 {settings['steps']} steps\n"
+                    f"🎨 CFG: {settings['guidance_scale']}",
+                    message.chat.id,
+                    status_msg.message_id,
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
+    
+    try:
+        image_path = generate_image(
+            prompt=prompt, 
+            output_filename=filename,
+            width=settings['width'], 
+            height=settings['height'],
+            steps=settings['steps'], 
+            guidance_scale=settings['guidance_scale'],
+            seed=settings['seed'] if settings['seed'] != -1 else None,
+            use_face_correction=False,
+            progress_callback=update_progress
+        )
+        
         last_photo[message.from_user.id] = image_path
         
         with open(image_path, 'rb') as photo:
-            bot.send_photo(message.chat.id, photo, 
-                          caption=f"✨ *Готово!*\n\n`{prompt[:100]}`\n\n🔼 /upscale — увеличить\n🖼 /last — показать последнюю",
-                          parse_mode='Markdown')
+            bot.send_photo(
+                message.chat.id, 
+                photo, 
+                caption=f"✨ *Готово!*\n\n"
+                       f"📝 `{prompt[:100]}`\n\n"
+                       f"🔼 /upscale — увеличить\n"
+                       f"🖼 /last — показать последнюю",
+                parse_mode='Markdown'
+            )
         
-        # НЕ УДАЛЯЕМ файл! Он нужен для upscale
-        # bot.delete_message(message.chat.id, status_msg.message_id) - тоже не удаляем
-        
-        bot.edit_message_text(f"✅ Генерация завершена!", 
-                            message.chat.id, status_msg.message_id)
+        bot.delete_message(message.chat.id, status_msg.message_id)
         
     except Exception as e:
-        bot.edit_message_text(f"💥 Ошибка: {str(e)}", message.chat.id, status_msg.message_id)
+        bot.edit_message_text(f"💥 *Ошибка*\n`{str(e)[:200]}`", 
+                            message.chat.id, status_msg.message_id,
+                            parse_mode='Markdown')
+    
+    try:
+        image_path = generate_image(
+            prompt=prompt, 
+            output_filename=filename,
+            width=settings['width'], 
+            height=settings['height'],
+            steps=settings['steps'], 
+            guidance_scale=settings['guidance_scale'],
+            seed=settings['seed'] if settings['seed'] != -1 else None,
+            progress_callback=update_progress
+        )
+        
+        # Сохраняем путь к картинке
+        last_photo[message.from_user.id] = image_path
+        
+        # Финальное сообщение
+        bot.edit_message_text(
+            f"✅ *Генерация завершена!*\n\n"
+            f"📐 {settings['width']}×{settings['height']}\n"
+            f"🔢 {settings['steps']} steps\n"
+            f"🎨 CFG: {settings['guidance_scale']}\n\n"
+            f"📤 Отправляю картинку...",
+            message.chat.id,
+            status_msg.message_id,
+            parse_mode='Markdown'
+        )
+        
+        # Отправляем фото
+        with open(image_path, 'rb') as photo:
+            bot.send_photo(
+                message.chat.id, 
+                photo, 
+                caption=f"✨ *Готово!*\n\n"
+                       f"📝 `{prompt[:100]}`\n\n"
+                       f"🔼 /upscale — увеличить\n"
+                       f"🖼 /last — показать последнюю",
+                parse_mode='Markdown'
+            )
+        
+        # Удаляем статусное сообщение через 3 секунды
+        time.sleep(3)
+        bot.delete_message(message.chat.id, status_msg.message_id)
+        
+    except Exception as e:
+        error_text = str(e)
+        bot.edit_message_text(
+            f"💥 *Ошибка генерации*\n\n`{error_text[:300]}`", 
+            message.chat.id, 
+            status_msg.message_id,
+            parse_mode='Markdown'
+        )
+        
         if os.path.exists(filename):
             os.remove(filename)
+  
 
 print("🤖 Бот запущен!")
 print(f"👥 Разрешённые пользователи: {ALLOWED_USERS}")
